@@ -14,8 +14,8 @@ inputs:
   app-id: { description: Stable Greenroom app identifier, required: false }
   base-sha: { description: Base commit SHA, required: true }
   head-sha: { description: Head commit SHA, required: true }
-  workflow-ref: { description: Exact reusable workflow ref trusted by Greenroom, required: true }
-  workflow-sha: { description: Commit SHA containing the trusted workflow, required: true }
+  workflow-ref: { description: Workflow identity override; normally taken from the OIDC token job_workflow_ref claim, required: false }
+  workflow-sha: { description: Workflow identity override; normally taken from the OIDC token job_workflow_sha claim, required: false }
   pull-request-number: { description: Pull request number, required: false }
   allowed-hosts: { description: Comma-separated network allowlist, required: false }
   goal: { description: Bounded validation goal, required: false }

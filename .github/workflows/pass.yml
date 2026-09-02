@@ -1,0 +1,173 @@
+# Greenroom's reusable release-pass workflow. Customers call this from their
+# own workflow with `uses: justindc100/greenroom-action/.github/workflows/pass.yml@<sha>`.
+#
+# Why a reusable workflow: the control plane trusts a run by the OIDC token's
+# job_workflow_ref / job_workflow_sha, and for a job defined in the customer's
+# own repository those claims change with every pull request. When the job is
+# defined here, the claims name THIS file at the pinned commit, which Greenroom
+# publishes as a trusted workflow (packages/production/config/trusted-workflows.json).
+# A pull request cannot change what this job does, so the policy read from the
+# base revision below really is the policy that ran.
+#
+# Published copies live in the public action repository (.github/workflows/pass.yml);
+# the source of truth is packages/runner/workflows/pass.yml in the private repo.
+name: Greenroom pass
+
+on:
+  workflow_call:
+    inputs:
+      platform:
+        description: web or ios
+        type: string
+        default: web
+      app-id:
+        description: Stable Greenroom app slug for this repository
+        type: string
+        required: true
+      prepare:
+        description: Shell to build and serve the preview before the pass (background the server with &)
+        type: string
+        default: ""
+      target-url:
+        description: Web preview URL the pass walks (its host must be in the manifest allowlist)
+        type: string
+        default: ""
+      artifact-path:
+        description: Directory (web) or .app bundle (iOS) whose content digest attests the build
+        type: string
+        default: "."
+      app:
+        description: iOS bundle identifier
+        type: string
+        default: ""
+      device:
+        description: Exact iOS Simulator name or UDID
+        type: string
+        default: ""
+      goal:
+        description: Bounded validation goal
+        type: string
+        default: ""
+      allowed-hosts:
+        description: Comma-separated network allowlist override
+        type: string
+        default: ""
+      environment-manifest:
+        description: Path (in the repository) of the environment attestation, read from the PR base revision
+        type: string
+        default: .greenroom/environment.json
+      state-contract:
+        description: Path (in the repository) of the route-state contract, read from the PR base revision
+        type: string
+        default: .greenroom/state-contract.json
+      greenroom-api-url:
+        type: string
+        default: https://app.getgreenroom.io
+      runs-on:
+        description: Runner label (ubuntu-latest for web, macos-15 for iOS)
+        type: string
+        default: ubuntu-latest
+      source-upload-allowed:
+        description: Include bounded patches and a source index (server policy must also allow it)
+        type: string
+        default: "false"
+      fail-on-infra-error:
+        type: string
+        default: "false"
+    outputs:
+      run-id:
+        value: ${{ jobs.pass.outputs.run-id }}
+      report-url:
+        value: ${{ jobs.pass.outputs.report-url }}
+      runner-verdict:
+        value: ${{ jobs.pass.outputs.runner-verdict }}
+
+permissions:
+  contents: read
+
+jobs:
+  pass:
+    name: Greenroom pass
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      run-id: ${{ steps.greenroom.outputs.run-id }}
+      report-url: ${{ steps.greenroom.outputs.report-url }}
+      runner-verdict: ${{ steps.greenroom.outputs.runner-verdict }}
+    steps:
+      - name: Check out the pull request
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The runner is fetched at this workflow file's own commit, so the code
+      # that runs is exactly the code the trusted workflow SHA names.
+      - name: Fetch the Greenroom runner at this workflow's commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: justindc100/greenroom-action
+          ref: ${{ github.job_workflow_sha }}
+          path: .greenroom-action
+          persist-credentials: false
+
+      - name: Materialize Greenroom policy from the trusted base revision
+        id: policy
+        shell: bash
+        env:
+          GREENROOM_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          MANIFEST_PATH: ${{ inputs.environment-manifest }}
+          CONTRACT_PATH: ${{ inputs.state-contract }}
+        run: |
+          set -euo pipefail
+          git show "${GREENROOM_BASE_SHA}:${MANIFEST_PATH}" > "${RUNNER_TEMP}/greenroom-environment.json"
+          echo "manifest=${RUNNER_TEMP}/greenroom-environment.json" >> "$GITHUB_OUTPUT"
+          if git cat-file -e "${GREENROOM_BASE_SHA}:${CONTRACT_PATH}" 2>/dev/null; then
+            git show "${GREENROOM_BASE_SHA}:${CONTRACT_PATH}" > "${RUNNER_TEMP}/greenroom-state-contract.json"
+            echo "contract=${RUNNER_TEMP}/greenroom-state-contract.json" >> "$GITHUB_OUTPUT"
+          else
+            echo "No ${CONTRACT_PATH} at the base revision; coverage authority stays requested-goal-only."
+            echo "contract=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Prepare the preview
+        if: inputs.prepare != ''
+        shell: bash
+        run: ${{ inputs.prepare }}
+
+      # A content digest of the built artifact attests what was walked. For a
+      # static web preview this is the served directory; for iOS the .app.
+      - name: Digest the build artifact
+        id: digest
+        shell: bash
+        env:
+          ARTIFACT_PATH: ${{ inputs.artifact-path }}
+        run: |
+          set -euo pipefail
+          if [ ! -e "$ARTIFACT_PATH" ]; then echo "artifact-path ${ARTIFACT_PATH} does not exist" >&2; exit 1; fi
+          digest=$(tar --exclude=.git --exclude=.greenroom-action --exclude=node_modules --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -cf - "$ARTIFACT_PATH" | sha256sum | cut -d' ' -f1)
+          echo "sha256=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Greenroom release pass
+        id: greenroom
+        uses: ./.greenroom-action
+        with:
+          greenroom-api-url: ${{ inputs.greenroom-api-url }}
+          platform: ${{ inputs.platform }}
+          target-url: ${{ inputs.target-url }}
+          artifact: ${{ inputs.platform == 'ios' && inputs.artifact-path || '' }}
+          artifact-digest: ${{ inputs.platform == 'web' && steps.digest.outputs.sha256 || '' }}
+          app: ${{ inputs.app }}
+          device: ${{ inputs.device }}
+          app-id: ${{ inputs.app-id }}
+          goal: ${{ inputs.goal }}
+          allowed-hosts: ${{ inputs.allowed-hosts }}
+          environment-manifest: ${{ steps.policy.outputs.manifest }}
+          state-contract: ${{ steps.policy.outputs.contract }}
+          base-sha: ${{ github.event.pull_request.base.sha }}
+          head-sha: ${{ github.event.pull_request.head.sha }}
+          pull-request-number: ${{ github.event.pull_request.number }}
+          source-upload-allowed: ${{ inputs.source-upload-allowed }}
+          fail-on-infra-error: ${{ inputs.fail-on-infra-error }}
