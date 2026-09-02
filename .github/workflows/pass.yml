@@ -36,6 +36,10 @@ on:
         description: Directory (web) or .app bundle (iOS) whose content digest attests the build
         type: string
         default: "."
+      artifact-name:
+        description: Name of a workflow artifact (from a separate secretless build job) to download to artifact-path before the pass
+        type: string
+        default: ""
       app:
         description: iOS bundle identifier
         type: string
@@ -131,6 +135,16 @@ jobs:
             echo "No ${CONTRACT_PATH} at the base revision; coverage authority stays requested-goal-only."
             echo "contract=" >> "$GITHUB_OUTPUT"
           fi
+
+      # Two-job split: a separate build job (no secrets, no Greenroom identity)
+      # uploads the simulator .app or the built preview, and this job only
+      # downloads it. See the CI workflow reference.
+      - name: Download the build artifact
+        if: inputs.artifact-name != ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ inputs.artifact-path }}
 
       - name: Prepare the preview
         if: inputs.prepare != ''
