@@ -1,0 +1,30 @@
+name: Greenroom UX validation
+description: Run an evidence-backed UX validation pass with GitHub OIDC and no reusable Greenroom secret.
+author: Greenroom
+inputs:
+  greenroom-api-url: { description: Greenroom control-plane URL, required: true }
+  artifact: { description: Path to an attested build artifact, required: false }
+  artifact-digest: { description: Precomputed SHA-256 artifact digest, required: false }
+  platform: { description: web or ios, required: true, default: ios }
+  app: { description: iOS app bundle ID or URL passed to agent-device, required: false }
+  target-url: { description: Web preview URL, required: false }
+  environment-manifest: { description: Path to the reviewed isolated-environment attestation, required: true }
+  state-contract: { description: Path to the reviewed route-state contract from the trusted base revision, required: false }
+  device: { description: Exact iOS Simulator name or UDID, required: false }
+  app-id: { description: Stable Greenroom app identifier, required: false }
+  base-sha: { description: Base commit SHA, required: true }
+  head-sha: { description: Head commit SHA, required: true }
+  workflow-ref: { description: Exact reusable workflow ref trusted by Greenroom, required: true }
+  workflow-sha: { description: Commit SHA containing the trusted workflow, required: true }
+  pull-request-number: { description: Pull request number, required: false }
+  allowed-hosts: { description: Comma-separated network allowlist, required: false }
+  goal: { description: Bounded validation goal, required: false }
+  source-upload-allowed: { description: Explicitly include bounded patches and a source index; server policy must also allow it, required: false, default: "false" }
+  fail-on-infra-error: { description: Opt in to failing CI for Greenroom infrastructure errors, required: false, default: "false" }
+outputs:
+  run-id: { description: Greenroom run ID }
+  report-url: { description: Authenticated Greenroom report URL }
+  runner-verdict: { description: Local runner outcome before asynchronous judgment }
+runs:
+  using: node20
+  main: dist/index.js
