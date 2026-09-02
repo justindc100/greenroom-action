@@ -17,6 +17,8 @@ inputs:
   workflow-ref: { description: Workflow identity override; normally taken from the OIDC token job_workflow_ref claim, required: false }
   workflow-sha: { description: Workflow identity override; normally taken from the OIDC token job_workflow_sha claim, required: false }
   pull-request-number: { description: Pull request number, required: false }
+  pull-request-title: { description: Pull request title, shown as the release label in the Greenroom dashboard (300 characters max), required: false }
+  head-ref: { description: Head branch name, shown beside the PR number in the Greenroom dashboard (300 characters max), required: false }
   allowed-hosts: { description: Comma-separated network allowlist, required: false }
   goal: { description: Bounded validation goal, required: false }
   source-upload-allowed: { description: Explicitly include bounded patches and a source index; server policy must also allow it, required: false, default: "false" }

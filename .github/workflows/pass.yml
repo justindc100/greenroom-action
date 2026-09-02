@@ -183,5 +183,9 @@ jobs:
           base-sha: ${{ github.event.pull_request.base.sha }}
           head-sha: ${{ github.event.pull_request.head.sha }}
           pull-request-number: ${{ github.event.pull_request.number }}
+          # Dashboard labels only. Both reach the runner as INPUT_* environment
+          # variables (never a shell), so an adversarial PR title cannot inject.
+          pull-request-title: ${{ github.event.pull_request.title }}
+          head-ref: ${{ github.head_ref }}
           source-upload-allowed: ${{ inputs.source-upload-allowed }}
           fail-on-infra-error: ${{ inputs.fail-on-infra-error }}
