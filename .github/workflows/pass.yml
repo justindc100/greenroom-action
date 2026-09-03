@@ -117,15 +117,36 @@ jobs:
           path: .greenroom-action
           persist-credentials: false
 
+      # The event's pull_request.base.sha is the base commit GitHub last recorded
+      # on the pull request, which lags the base branch until the PR is next
+      # synchronized: a policy change merged to main is invisible to a PR's
+      # next run until then, and the diff against that stale base lists files
+      # main already has. The base branch's current tip is the trusted policy
+      # revision; the event's sha is only the fallback when the fetch fails.
       - name: Materialize Greenroom policy from the trusted base revision
         id: policy
         shell: bash
         env:
-          GREENROOM_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GREENROOM_EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GREENROOM_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          GREENROOM_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           MANIFEST_PATH: ${{ inputs.environment-manifest }}
           CONTRACT_PATH: ${{ inputs.state-contract }}
         run: |
           set -euo pipefail
+          # Policy comes from the base branch's tip; the diff the runner scopes
+          # from starts at the merge base of that tip and the PR head, so a PR
+          # that has not merged the latest base is not blamed for the base's own
+          # changes. Both fall back to the event's base sha.
+          GREENROOM_BASE_SHA="${GREENROOM_EVENT_BASE_SHA}"
+          GREENROOM_DIFF_BASE="${GREENROOM_EVENT_BASE_SHA}"
+          if [ -n "${GREENROOM_BASE_REF}" ] && git fetch --no-tags origin "refs/heads/${GREENROOM_BASE_REF}" 2>/dev/null; then
+            GREENROOM_BASE_SHA="$(git rev-parse FETCH_HEAD)"
+            GREENROOM_DIFF_BASE="$(git merge-base FETCH_HEAD "${GREENROOM_HEAD_SHA}" 2>/dev/null || echo "${GREENROOM_BASE_SHA}")"
+          fi
+          echo "policy-sha=${GREENROOM_BASE_SHA}" >> "$GITHUB_OUTPUT"
+          echo "base-sha=${GREENROOM_DIFF_BASE}" >> "$GITHUB_OUTPUT"
+          echo "Policy revision: ${GREENROOM_BASE_SHA} (base branch ${GREENROOM_BASE_REF:-unknown}; event base ${GREENROOM_EVENT_BASE_SHA}); diff base: ${GREENROOM_DIFF_BASE}"
           git show "${GREENROOM_BASE_SHA}:${MANIFEST_PATH}" > "${RUNNER_TEMP}/greenroom-environment.json"
           echo "manifest=${RUNNER_TEMP}/greenroom-environment.json" >> "$GITHUB_OUTPUT"
           if git cat-file -e "${GREENROOM_BASE_SHA}:${CONTRACT_PATH}" 2>/dev/null; then
@@ -180,7 +201,7 @@ jobs:
           allowed-hosts: ${{ inputs.allowed-hosts }}
           environment-manifest: ${{ steps.policy.outputs.manifest }}
           state-contract: ${{ steps.policy.outputs.contract }}
-          base-sha: ${{ github.event.pull_request.base.sha }}
+          base-sha: ${{ steps.policy.outputs.base-sha }}
           head-sha: ${{ github.event.pull_request.head.sha }}
           pull-request-number: ${{ github.event.pull_request.number }}
           # Dashboard labels only. Both reach the runner as INPUT_* environment
