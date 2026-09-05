@@ -23,10 +23,12 @@ inputs:
   goal: { description: Bounded validation goal, required: false }
   source-upload-allowed: { description: Explicitly include bounded patches and a source index; server policy must also allow it, required: false, default: "false" }
   fail-on-infra-error: { description: Opt in to failing CI for Greenroom infrastructure errors, required: false, default: "false" }
+  release-canary: { description: Internal release gate; wait for verified fresh evidence and GitHub Check delivery, required: false, default: "false" }
 outputs:
   run-id: { description: Greenroom run ID }
   report-url: { description: Authenticated Greenroom report URL }
   runner-verdict: { description: Local runner outcome before asynchronous judgment }
+  release-gate: { description: Internal release canary passed or failed after independent judgment and Check delivery }
 runs:
   using: node20
   main: dist/index.js
