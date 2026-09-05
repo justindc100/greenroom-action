@@ -78,6 +78,10 @@ on:
       fail-on-infra-error:
         type: string
         default: "false"
+      release-canary:
+        description: Internal release gate; wait for independent verification and Check delivery
+        type: string
+        default: "false"
     outputs:
       run-id:
         value: ${{ jobs.pass.outputs.run-id }}
@@ -85,6 +89,8 @@ on:
         value: ${{ jobs.pass.outputs.report-url }}
       runner-verdict:
         value: ${{ jobs.pass.outputs.runner-verdict }}
+      release-gate:
+        value: ${{ jobs.pass.outputs.release-gate }}
 
 permissions:
   contents: read
@@ -100,6 +106,7 @@ jobs:
       run-id: ${{ steps.greenroom.outputs.run-id }}
       report-url: ${{ steps.greenroom.outputs.report-url }}
       runner-verdict: ${{ steps.greenroom.outputs.runner-verdict }}
+      release-gate: ${{ steps.greenroom.outputs.release-gate }}
     steps:
       - name: Check out the pull request
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -107,15 +114,42 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # GitHub exposes the called workflow identity on job.*, not github.*.
+      # Reject missing identity before checkout can fall back to mutable main.
+      - name: Require the reusable workflow identity
+        id: runner-identity
+        shell: bash
+        env:
+          GREENROOM_JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          GREENROOM_JOB_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          GREENROOM_JOB_WORKFLOW_PATH: ${{ job.workflow_file_path }}
+        run: |
+          set -euo pipefail
+          test "$GREENROOM_JOB_WORKFLOW_REPOSITORY" = justindc100/greenroom-action
+          test "$GREENROOM_JOB_WORKFLOW_PATH" = .github/workflows/pass.yml
+          if [[ ! "$GREENROOM_JOB_WORKFLOW_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            echo "Missing or invalid reusable workflow SHA" >&2
+            exit 1
+          fi
+          echo "sha=$GREENROOM_JOB_WORKFLOW_SHA" >> "$GITHUB_OUTPUT"
+
       # The runner is fetched at this workflow file's own commit, so the code
       # that runs is exactly the code the trusted workflow SHA names.
       - name: Fetch the Greenroom runner at this workflow's commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: justindc100/greenroom-action
-          ref: ${{ github.job_workflow_sha }}
+          ref: ${{ steps.runner-identity.outputs.sha }}
           path: .greenroom-action
           persist-credentials: false
+
+      - name: Verify the fetched runner revision
+        shell: bash
+        env:
+          GREENROOM_EXPECTED_RUNNER_SHA: ${{ steps.runner-identity.outputs.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git -C .greenroom-action rev-parse HEAD)" = "$GREENROOM_EXPECTED_RUNNER_SHA"
 
       # The event's pull_request.base.sha is the base commit GitHub last recorded
       # on the pull request, which lags the base branch until the PR is next
@@ -175,6 +209,9 @@ jobs:
       # A content digest of the built artifact attests what was walked. For a
       # static web preview this is the served directory; for iOS the .app.
       - name: Digest the build artifact
+        # iOS is hashed by the runner's Node implementation. This GNU tar
+        # command is for the Linux web job only; macOS ships BSD tar.
+        if: inputs.platform == 'web'
         id: digest
         shell: bash
         env:
@@ -210,3 +247,4 @@ jobs:
           head-ref: ${{ github.head_ref }}
           source-upload-allowed: ${{ inputs.source-upload-allowed }}
           fail-on-infra-error: ${{ inputs.fail-on-infra-error }}
+          release-canary: ${{ inputs.release-canary }}
