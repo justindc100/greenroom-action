@@ -1,38 +1,27 @@
 # Greenroom GitHub Action
 
-Runs a Greenroom release pass from your CI: a virtual user walks the screens your pull request changed, on a real browser or iOS Simulator, and posts an evidence-backed QA handoff to the PR as a GitHub Check run.
+Greenroom tests the customer journeys affected by a pull request in your browser or iOS Simulator, then publishes an authenticated report and a GitHub Check with findings and evidence.
 
-This repository holds only the built runner (`dist/`) and its `action.yml`. Source lives in the private Greenroom repository; each commit here is a reviewed release of the runner bundle.
+## Set up Greenroom
 
-## Usage
+Use the maintained quickstart for your platform:
 
-Pin to a commit SHA, never a branch. Quickstarts and the field reference for the two config files live at https://docs.getgreenroom.io.
+- [Web quickstart](https://docs.getgreenroom.io/docs/quickstart/web)
+- [iOS quickstart](https://docs.getgreenroom.io/docs/quickstart/ios)
+- [Workflow inputs and outputs](https://docs.getgreenroom.io/docs/reference/ci-workflow)
 
-```yaml
-- uses: justindc100/greenroom-action@<reviewed-commit-sha>
-  with:
-    greenroom-api-url: https://app.getgreenroom.io
-    platform: web                      # or ios
-    target-url: http://127.0.0.1:4173  # web preview; ios uses `app` instead
-    environment-manifest: ${{ runner.temp }}/greenroom-environment.json
-    state-contract: ${{ runner.temp }}/greenroom-state-contract.json
-    base-sha: ${{ github.event.pull_request.base.sha }}
-    head-sha: ${{ github.event.pull_request.head.sha }}
-    workflow-ref: ${{ github.workflow_ref }}
-    workflow-sha: ${{ github.workflow_sha }}
-    pull-request-number: ${{ github.event.pull_request.number }}
-```
+Customer jobs call the pinned reusable workflow at `.github/workflows/pass.yml`. Copy the complete job and immutable release SHA from the quickstart. Review and merge the workflow, state contract, and test-environment manifest into your base branch before opening a separate test PR. Keep production credentials out of the test job.
 
-The job needs `id-token: write` (the runner authenticates with GitHub Actions OIDC; there is no reusable Greenroom secret) and `contents: read`. Read the environment manifest and state contract from the PR's base revision, as the quickstart shows, so a pull request cannot loosen its own policy.
+The reusable job uses GitHub OIDC; no reusable Greenroom secret is needed. Customer passes are advisory by default. A clean result covers only the behavior and evidence recorded in that pass.
 
-## Inputs and outputs
+## Releases
 
-See [`action.yml`](action.yml). Outputs: `run-id`, `report-url`, `runner-verdict`.
+Branches may contain unaccepted candidates. Use the accepted immutable SHA in the quickstarts rather than a branch name. Greenroom's release canary requires both web and native iOS acceptance before updating that stable pin.
 
-## What ships in `dist/`
+## Repository contents
 
-`dist/index.js` is the bundled runner. `dist/node_modules/` vendors `playwright-core` (web) and `agent-device` with its dependencies (iOS Simulator). Third-party licenses are listed in `dist/licenses.txt` and alongside each vendored package.
+This repository contains the reusable workflow, `action.yml`, and the bundled runner in `dist/`. `dist/node_modules/` includes Playwright and the native automation CLI with their dependencies. Source is maintained in the private Greenroom repository; third-party license files accompany the vendored packages.
 
 ## License
 
-Copyright © Greenroom. All rights reserved. Use of this action is governed by your Greenroom agreement; the vendored third-party packages keep their own licenses.
+Copyright © Greenroom. All rights reserved. Use is governed by your Greenroom agreement; vendored third-party packages retain their own licenses.
