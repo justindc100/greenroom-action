@@ -48,6 +48,26 @@ on:
         description: Exact iOS Simulator name or UDID
         type: string
         default: ""
+      ios-warm:
+        description: >-
+          Experimental, opt in ("true"): before the artifact download and your prepare script, find or create the
+          simulator named by `device`, boot it, and compile Greenroom's XCTest runner while it boots (the UDID reaches
+          your prepare step as GREENROOM_SIMULATOR_UDID). Off by default: the job then prepares the way runner 0.3.13
+          did, the simulator booted by your prepare script or by the pass and the XCTest runner built at first use.
+          The two hosted attempts that used the warm-up (2026-09-09) shortened the prepare step to 123 s and 104 s of
+          600 s but lost the app session when agent-device restarted its XCTest runner mid-walk
+          (docs/canaries/attempts/release-0314-2026-09-09.json, release-0315-2026-09-09.json).
+        type: string
+        default: "false"
+      ios-warm-stop-daemon:
+        description: >-
+          Only with ios-warm "true". Opt in ("true") to stop the warm-up's agent-device daemon and release its XCTest
+          runner before your prepare script runs. Only for a prepare script that drives agent-device under its own
+          AGENT_DEVICE_STATE_DIR (it would otherwise be told the runner is owned by another daemon); the pass then
+          starts the runner again. Default: the warmed daemon and runner stay up in the default state directory for
+          your prepare and the pass to reuse.
+        type: string
+        default: "false"
       goal:
         description: Bounded validation goal
         type: string
@@ -82,6 +102,13 @@ on:
         description: Internal release gate; wait for independent verification and Check delivery
         type: string
         default: "false"
+    secrets:
+      session:
+        description: >-
+          Session payload for an app that starts signed in (environment manifest auth.mechanism session_import):
+          the JSON object the authenticated-apps guide describes, from the repository secret the manifest names.
+          Leave it unset for a signed_out manifest.
+        required: false
     outputs:
       run-id:
         value: ${{ jobs.pass.outputs.run-id }}
@@ -192,6 +219,65 @@ jobs:
             echo "contract=" >> "$GITHUB_OUTPUT"
           fi
 
+      # Spotlight indexing off on a GitHub-hosted Mac before any simulator
+      # boots (the warm-up below, the customer's prepare script, or the pass's
+      # own preparation). The three no-model host smokes of 2026-09-09 on the
+      # macos-26 image (GR-12; fixture-repository Actions 34408902477,
+      # 34410772878 and 34412523322) sampled the ten busiest processes on the
+      # 3-vCPU / 7 GiB VirtualMac2,1 hosts: the image's Spotlight indexer
+      # (`mds`, `mds_stores`, four to six `mdworker_shared` at 9-29 % each,
+      # several "stuck") was saturating the CPU as each job started, with a
+      # 1-minute load of 85 to 212, and the first display capture after
+      # `open` took 6 to 15 s in every run, the prelude of the 0.3.16
+      # canary's watchdog failure. `mdutil -a -i off` stops indexing on every
+      # volume; the host is ephemeral and nothing depends on its index.
+      # Passwordless sudo is part of GitHub's hosted macOS images; on a
+      # self-hosted runner this step is skipped (runner.environment), so a
+      # customer's own Mac keeps its Spotlight. A failure here is a warning,
+      # never a failed job.
+      - name: Turn Spotlight indexing off on the hosted Mac
+        if: inputs.platform == 'ios' && runner.environment == 'github-hosted'
+        shell: bash
+        run: |
+          set +e
+          if sudo mdutil -a -i off; then echo "Spotlight indexing off on every volume."; else echo "::warning::sudo mdutil -a -i off failed (exit $?); the host keeps indexing"; fi
+          sudo mdutil -a -s 2>/dev/null | head -20
+          exit 0
+
+      # Opt-in iOS preparation warm-up (input ios-warm, off by default),
+      # before the artifact download and the customer's prepare: find or
+      # create the simulator named by `device`, boot it, and compile
+      # agent-device's XCTest runner while it boots. A cold macos-26 host
+      # spends 150-395 s on first boot and 118-165 s on that build
+      # (docs/pilots/suelto, docs/canaries, 2026-09-06); in parallel they cost
+      # the larger of the two, not the sum. The warm-up's agent-device daemon
+      # and the XCTest runner it started and health-checked stay running in
+      # the default state directory, so the prepare script's and the runner's
+      # own `prepare ios-runner` reuse that runner instead of starting another
+      # (lib/ios-warm.js; 0.3.14 stopped it and re-prepared for 72 s). The
+      # simulator's UDID is exported as GREENROOM_SIMULATOR_UDID for the
+      # prepare script; a script that creates the device itself must reuse
+      # this one instead. A boot that does not finish within 10 minutes fails
+      # here, before a run is minted, with the reason named.
+      #
+      # Off by default since 0.3.16: on both hosted canaries that ran it
+      # (0.3.14 and 0.3.15, 2026-09-09) the prepare step shrank to 123 s and
+      # 104 s of 600 s, but agent-device's daemon then interrupted and
+      # restarted its XCTest runner mid-walk on the hosted Mac and the app
+      # session did not survive (docs/canaries/attempts/release-0314-2026-09-09.json,
+      # release-0315-2026-09-09.json); an idle Mac does not reproduce it.
+      # When the input is not "true" this step is skipped and the job prepares
+      # exactly as runner 0.3.13 did: the prepare script (or the pass itself,
+      # lib/ios-artifact.js, bootstatus bound 600 s) boots the simulator and
+      # the XCTest runner is built at the pass's first use.
+      - name: Warm the iOS simulator and XCTest runner
+        if: inputs.platform == 'ios' && inputs.device != '' && inputs.ios-warm == 'true'
+        shell: bash
+        env:
+          GREENROOM_DEVICE: ${{ inputs.device }}
+          GREENROOM_IOS_WARM_STOP_DAEMON: ${{ inputs.ios-warm-stop-daemon }}
+        run: node .greenroom-action/dist/index.js warm-ios --device "$GREENROOM_DEVICE" --receipt "$RUNNER_TEMP/greenroom-ios-warm.json" --stop-daemon "$GREENROOM_IOS_WARM_STOP_DAEMON"
+
       # Two-job split: a separate build job (no secrets, no Greenroom identity)
       # uploads the simulator .app or the built preview, and this job only
       # downloads it. See the CI workflow reference.
@@ -226,6 +312,11 @@ jobs:
       - name: Greenroom release pass
         id: greenroom
         uses: ./.greenroom-action
+        # The session payload reaches the runner as one environment variable
+        # (packages/runner/lib/session-import.js SESSION_ENV), never as an
+        # input, an argument or a shell; GitHub masks the secret in the log.
+        env:
+          GREENROOM_SESSION: ${{ secrets.session }}
         with:
           greenroom-api-url: ${{ inputs.greenroom-api-url }}
           platform: ${{ inputs.platform }}
@@ -249,3 +340,30 @@ jobs:
           source-upload-allowed: ${{ inputs.source-upload-allowed }}
           fail-on-infra-error: ${{ inputs.fail-on-infra-error }}
           release-canary: ${{ inputs.release-canary }}
+
+      # When an iOS job fails, keep agent-device's own diagnostics from the
+      # ephemeral host: the XCTest runner's build/start output (runner.log),
+      # the daemon's per-request logs and event stream for each sim-<udid>
+      # session, the daemon log, and, when ios-warm ran, the warm-up receipt
+      # (plus the private state directory when ios-warm-stop-daemon was used).
+      # They hold session
+      # names, simulator UDIDs, xcodebuild output and the runner's command
+      # requests and responses for the session, which are the accessibility
+      # snapshots the pass already uploads as run evidence; no secrets and no
+      # customer app content beyond what those logs already hold. The 0.3.14
+      # iOS canary failed with a bare "Command failed" line and none of this
+      # (docs/canaries/attempts/release-0314-2026-09-09.json).
+      - name: Upload agent-device session logs
+        if: failure() && inputs.platform == 'ios'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7, Node 24
+        with:
+          name: greenroom-agent-device-logs-${{ inputs.app-id }}-${{ github.run_attempt }}
+          path: |
+            ~/.agent-device/sessions/sim-*/runner.log
+            ~/.agent-device/sessions/sim-*/requests/
+            ~/.agent-device/sessions/sim-*/events.ndjson
+            ~/.agent-device/daemon.log
+            ${{ runner.temp }}/greenroom-ios-warm.json
+            ${{ runner.temp }}/greenroom-ios-warm-*/
+          if-no-files-found: warn
+          retention-days: 14
