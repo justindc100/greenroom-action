@@ -82,6 +82,13 @@ on:
         description: Internal release gate; wait for independent verification and Check delivery
         type: string
         default: "false"
+    secrets:
+      session:
+        description: >-
+          Session payload for an app that starts signed in (environment manifest auth.mechanism session_import):
+          the JSON object the authenticated-apps guide describes, from the repository secret the manifest names.
+          Leave it unset for a signed_out manifest.
+        required: false
     outputs:
       run-id:
         value: ${{ jobs.pass.outputs.run-id }}
@@ -192,6 +199,25 @@ jobs:
             echo "contract=" >> "$GITHUB_OUTPUT"
           fi
 
+      # iOS preparation warm-up, before the artifact download and the
+      # customer's prepare: find or create the simulator named by `device`,
+      # boot it, and compile agent-device's XCTest runner while it boots. A
+      # cold macos-26 host spends 150-395 s on first boot and 118-165 s on
+      # that build (docs/pilots/suelto, docs/canaries, 2026-09-06); in
+      # parallel they cost the larger of the two, not the sum. The compiled
+      # runner lands in agent-device's shared derived cache, so the prepare
+      # script's or the runner's own `prepare ios-runner` reuses it. The
+      # simulator's UDID is exported as GREENROOM_SIMULATOR_UDID for the
+      # prepare script; a script that creates the device itself must reuse
+      # this one instead. A boot that does not finish within 10 minutes fails
+      # here, before a run is minted, with the reason named.
+      - name: Warm the iOS simulator and XCTest runner
+        if: inputs.platform == 'ios' && inputs.device != ''
+        shell: bash
+        env:
+          GREENROOM_DEVICE: ${{ inputs.device }}
+        run: node .greenroom-action/dist/index.js warm-ios --device "$GREENROOM_DEVICE" --receipt "$RUNNER_TEMP/greenroom-ios-warm.json"
+
       # Two-job split: a separate build job (no secrets, no Greenroom identity)
       # uploads the simulator .app or the built preview, and this job only
       # downloads it. See the CI workflow reference.
@@ -226,6 +252,11 @@ jobs:
       - name: Greenroom release pass
         id: greenroom
         uses: ./.greenroom-action
+        # The session payload reaches the runner as one environment variable
+        # (packages/runner/lib/session-import.js SESSION_ENV), never as an
+        # input, an argument or a shell; GitHub masks the secret in the log.
+        env:
+          GREENROOM_SESSION: ${{ secrets.session }}
         with:
           greenroom-api-url: ${{ inputs.greenroom-api-url }}
           platform: ${{ inputs.platform }}
