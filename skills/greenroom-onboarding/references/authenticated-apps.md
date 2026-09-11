@@ -77,6 +77,7 @@ One JSON object whose keys are exactly the declared `accounts` and whose values 
 ```
 
 - A **disposable account on an isolated backend**: synthetic data only, minimal role, on the test or staging backend the `allowedHosts` name. Never production, never personal.
+- **In the state the entry state needs.** A valid session is not enough when the gated layout also redirects on server-side state: an app whose bootstrap hydrates "has completed onboarding" from the backend sends a bare account to `/onboarding`, and the first pass then reads as a broken import. Read the gated layout's conditions, answer "what server-side state must this account have for a fresh launch to land on `entryState`?" (completed onboarding, a built plan, a tier, a role), put the account in that state before issuing its session, and record the answer in the manifest notes (`--account-state`) and as the first checklist item.
 - **Issued by the backend's normal session issuer**: the same function or endpoint that sign-in calls (`createSession(userId)`, a test-only issuance endpoint that only exists on the isolated backend). No bypass in the app; no backend signing keys in the app or in Greenroom.
 - **Long enough for a pass**: the job runs up to 45 minutes; a refresh token the app exchanges on launch is the right shape. A short-lived access token alone expires before the walk.
 - Stored as a repository secret with the declared name; never in a workflow input, a file, a commit, a PR comment or a chat.

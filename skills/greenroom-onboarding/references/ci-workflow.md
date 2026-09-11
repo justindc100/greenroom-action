@@ -31,6 +31,8 @@ jobs:
 
 `uses:` names the reusable workflow at a full 40-character commit SHA. The stable pin is whatever the public quickstart currently quotes (https://docs.getgreenroom.io/docs/quickstart/web and `/ios` quote the same one); `greenroom-onboard.mjs pin` reads it. Never copy a SHA from memory, from another repository, or from an old file: Greenroom only accepts published commits, and the check compares the file's pin with the docs.
 
+**Which release a SHA is.** Issues and changelogs are written in runner release numbers (0.3.13, 0.3.17); the workflow is pinned by SHA. The CI-workflow reference page carries a release label beside its pin ("The `uses:` line above pins runner X.Y.Z (commit <sha>, trusted since <date>)"), and `pin` prints it as `release:`; inside the Greenroom repository it reads the trust list instead. When the page cannot be read or carries no label for the SHA, `pin` prints `release: unknown` with the reason. Record the SHA either way; it is the identity Greenroom trusts, and a release number never replaces it.
+
 ## Inputs (`with:`)
 
 | Input | Platform | Meaning |
@@ -79,7 +81,15 @@ test -f build/Example.app/main.jsbundle
 Rules behind it:
 
 - **CocoaPods is pinned to the lockfile's version.** The hosted `macos-26` image ships CocoaPods 1.17.0 and refuses a `Podfile.lock` written by another version. The check reports `cocoapods-lockfile-drift` when nothing pins it.
-- **No `Podfile.lock` tracked (generated `ios/`):** the draft never writes an unpinned `pod install` (the image would resolve pods with its own CocoaPods, differently from the owner's machine and from run to run), and the check refuses one (`cocoapods-unpinned`). Produce the lockfile once, locally: `npx expo prebuild --platform ios --no-install && pod install --project-directory=ios`, then `mkdir -p .greenroom && cp ios/Podfile.lock .greenroom/Podfile.lock`, commit it, and pin the version its last line names (`COCOAPODS: X.Y.Z`); re-running the draft pins it. Until the file exists the check reports `podfile-lock-missing`. `--deployment` makes `pod install` fail instead of silently updating the lockfile.
+- **No `Podfile.lock` tracked (generated `ios/`):** the draft never writes an unpinned `pod install` (the image would resolve pods with its own CocoaPods, differently from the owner's machine and from run to run), and the check refuses one (`cocoapods-unpinned`). Produce the lockfile once, locally, under a UTF-8 locale (without one `pod install` aborts on the first podspec with a non-ASCII byte: "invalid byte sequence in US-ASCII"), copy it out, and delete the generated `ios/` tree (hundreds of MB of downloaded Pods, gitignored, rebuilt in CI):
+
+  ```
+  export LANG=en_US.UTF-8 && npx expo prebuild --platform ios --no-install && pod install --project-directory=ios
+  mkdir -p .greenroom && cp ios/Podfile.lock .greenroom/Podfile.lock && rm -rf ios
+  node "<skill>/scripts/greenroom-onboard.mjs" pin-cocoapods .
+  ```
+
+  `pin-cocoapods` pins the version the lockfile's last line names (`COCOAPODS: X.Y.Z`) in the `gem install` and `pod _X.Y.Z_ install` lines and removes the drafted recipe comment, touching no other line (re-drafting would need `--overwrite` and lose hand-written goals). Commit `.greenroom/Podfile.lock`. Until the file exists the check reports `podfile-lock-missing`. `--deployment` makes `pod install` fail instead of silently updating the lockfile.
 - **`brew --prefix <formula>` succeeds for a formula that is not installed.** Install what the build needs or test `brew list --versions` first; the check reports `brew-formula-not-installed`.
 - **Release configuration with the JS bundle embedded** (`main.jsbundle`): the simulator build must not depend on a Metro dev server.
 - **Ad-hoc signed.** Xcode's default "Sign to Run Locally" is enough. `CODE_SIGNING_ALLOWED=NO` produces an unsigned build that cannot use the Keychain (`errSecMissingEntitlement`, -34018), which breaks a session import.
@@ -93,7 +103,14 @@ Rules behind it:
 - **A public SDK key may be exported there**, and must be when the app refuses to start without it (an SDK initializer that throws, as RevenueCat's `configure` does). Use a **test project's** public key, never the production project's, and hand it in through a GitHub Actions variable (`export REVENUECAT_API_KEY_IOS=${{ vars.REVENUECAT_TEST_PUBLIC_KEY }}`) so the value is not in Git. Public keys are the ones the vendor designs to ship inside the app binary: RevenueCat public SDK keys, PostHog project tokens, Stripe publishable keys, Firebase web config, map SDK keys. The SDK's host then belongs in `allowedHosts`.
 - **A private key never goes there**: secret keys, service-role keys, signing keys, database URLs, personal tokens. The check reports `private-key-in-prepare` for a value that looks like one (`sk_live_…`, a PEM block, a JWT, an AWS or GitHub token) and for any `${{ secrets.… }}` reference in `prepare`. The only secret the job carries is `secrets.session`, and only the runner step sees it.
 
-Draft with `--sdk-keys NAME,NAME` to write the export lines with a `REPLACE_WITH_<SDK>_TEST_PROJECT_PUBLIC_SDK_KEY` placeholder; without the flag the draft lists the public keys the build reads in a comment and leaves them unset, which keeps the SDK off in the test build.
+Draft with `--sdk-keys NAME,NAME` and the draft writes, per key, the variable read and a guard:
+
+```bash
+export REVENUECAT_API_KEY_IOS="${{ vars.REVENUECAT_TEST_PUBLIC_KEY }}"
+test -n "$REVENUECAT_API_KEY_IOS" || { echo "Set the repository variable REVENUECAT_TEST_PUBLIC_KEY to a REVENUECAT TEST project's public key"; exit 1; }
+```
+
+The variable is named after the key's family (`<FAMILY>_TEST_PUBLIC_KEY`; the full key name plus `_TEST_PUBLIC` when two keys share a family). GitHub evaluates `${{ vars.NAME }}` in a reusable workflow's `with:` inputs, so the value reaches `prepare` without ever being in Git, and the guard fails the build early, naming the variable, when the owner has not set it yet (Settings > Secrets and variables > Actions > Variables, not Secrets). Nothing is left to replace in the file; the owner checklist says which variable to set. Without the flag the draft lists the public keys the build reads in a comment and leaves them unset, which keeps the SDK off in the test build. The check accepts the `vars.` form and refuses `${{ secrets.… }}` and private-looking literals.
 
 ## Which bundle identifier
 

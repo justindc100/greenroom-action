@@ -31,6 +31,7 @@ const SLUG = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const FILES = { workflow: ".github/workflows/greenroom.yml", environment: ".greenroom/environment.json", contract: ".greenroom/state-contract.json" };
 const WEB_PREVIEW_URL = "http://127.0.0.1:4173/";
 const IGNORED_DIRS = new Set([".git", "node_modules", "Pods", "build", "dist", ".next", ".vercel", ".claude", ".codex", ".cursor", ".idea", ".vscode", "coverage", "android", "DerivedData", ".expo", "vendor", ".greenroom-draft", "__pycache__", ".build", "web-build"]);
+const HIDDEN_DIRS_READ = new Set([".github", ".greenroom"]);
 // Directories that are not the app the walk exercises (a co-located backend,
 // docs, design files, CI helpers): hosts found there are not the app's.
 const NOT_THE_APP = /^(server|backend|api|docs?|design|marketing|fastlane|e2e|__mocks__|tests?|scripts|infra|terraform|\.github|\.greenroom)\//;
@@ -74,6 +75,9 @@ function walk(directory, { extensions = null, limit = 40000 } = {}) {
       if (IGNORED_DIRS.has(entry.name)) continue;
       const full = path.join(dir, entry.name);
       if (entry.isSymbolicLink()) continue;
+      // Hidden directories are tooling and nested checkouts (.release-worktrees,
+      // .claude, .cache), never the app; only .github and .greenroom are read.
+      if (entry.isDirectory() && entry.name.startsWith(".") && !HIDDEN_DIRS_READ.has(entry.name)) continue;
       if (entry.isDirectory()) visit(full);
       else {
         const relative = posix(path.relative(directory, full));
@@ -133,13 +137,29 @@ export async function fetchStablePin({ platform = "web", docsUrl = null } = {}) 
 }
 
 // Which runner release a pin is. Inside the Greenroom repository the trust
-// list says (its note names the runner version); a customer's copy has only
-// the docs page, which quotes the SHA alone, so it says so instead of guessing.
-export async function releaseNameOf(sha) {
+// list says (its note names the runner version). A customer's copy reads the
+// release label the public CI-workflow reference carries next to the stable
+// pin ("pins runner X.Y.Z (commit <sha> ...)"); when the page cannot be read
+// or carries no label for that SHA, it says so instead of guessing.
+const RELEASE_LABEL = /pins runner (\d+\.\d+\.\d+) \(commit ([a-f0-9]{40})/g;
+export function releaseLabelIn(text, sha) {
+  const plain = String(text ?? "").replace(/<[^>]+>/g, "").replace(/&#x27;|&#39;/g, "'").replace(/&quot;/g, "\"").replace(/&amp;/g, "&");
+  for (const match of plain.matchAll(RELEASE_LABEL)) if (match[2] === sha) return `runner ${match[1]}`;
+  return null;
+}
+export async function releaseNameOf(sha, { docsText = null, docsUrl = null, offline = false } = {}) {
   const trust = process.env.GREENROOM_ONBOARD_STANDALONE === "1" ? null : readJson(path.join(REPO_ROOT, "packages/production/config/trusted-workflows.json"));
   const entry = trust?.workflows?.find((item) => item.sha === sha);
-  if (entry) return `${entry.note ?? "(no note)"} [status ${entry.status}, since ${entry.since}]`;
-  return "the docs page quotes the commit SHA only; the SHA is the identity Greenroom trusts, so quote it (not a version number) in your setup record";
+  if (entry) return `${entry.note ?? "(no note)"} [status ${entry.status}, since ${entry.since}; from packages/production/config/trusted-workflows.json]`;
+  const url = docsUrl ?? `${DOCS_ORIGIN}/docs/reference/ci-workflow`;
+  let text = docsText;
+  if (text === null && !offline) {
+    try { const response = await fetch(url, { headers: { accept: "text/html" }, signal: AbortSignal.timeout(20000) }); text = response.ok ? await response.text() : null; } catch { text = null; }
+  }
+  if (text === null) return `unknown: ${url} could not be read, so the release this SHA is cannot be resolved here. Quote the SHA (the identity Greenroom trusts) in your setup record and ask Greenroom which runner release it is if an issue or changelog names one.`;
+  const label = releaseLabelIn(text, sha);
+  if (label) return `${label} (release label read from ${url})`;
+  return `unknown: ${url} carries no release label for this SHA (the docs quote the SHA alone). Quote the SHA (the identity Greenroom trusts) in your setup record and ask Greenroom which runner release it is if an issue or changelog names one.`;
 }
 
 async function resolvePin(values, platform) {
@@ -156,7 +176,7 @@ async function resolvePin(values, platform) {
 
 // ------------------------------------------------------------- detection
 const KNOWN_SDK_HOSTS = [
-  { dependency: /^react-native-purchases$|^@revenuecat\//, hosts: ["api.revenuecat.com"], note: "RevenueCat native SDK; not covered by any JS fetch patch" },
+  { dependency: /^react-native-purchases$|^@revenuecat\//, hosts: ["api.revenuecat.com", "api.rc-backup.com"], note: "RevenueCat native SDK; not covered by any JS fetch patch. It falls back to api.rc-backup.com when api.revenuecat.com fails, so list both or a first pass can end on the backup host" },
   { dependency: /^posthog-(react-native|js|node)$/, hosts: ["us.i.posthog.com"], note: "PostHog (us.i.posthog.com by default; eu.i.posthog.com for EU projects; check POSTHOG_HOST)" },
   { dependency: /^@sentry\//, hosts: ["ingest.sentry.io"], note: "Sentry ingest host is o<org>.ingest.<region>.sentry.io from the DSN. A test build compiled without a DSN sends nothing: list no Sentry host at all. Only when the test build carries a DSN, list its exact host (the DSN is a public value the app ships with; never read it from .env)" },
   { dependency: /^react-native-fbsdk-next$|^react-native-fbsdk$/, hosts: ["graph.facebook.com"], note: "Meta SDK attribution and events" },
@@ -518,7 +538,13 @@ function detectBuild(root, projectRoot, framework, deps, files) {
 
 function expoSlug(root, projectRoot) { const appJson = readJson(path.join(root, projectRoot, "app.json")); return appJson?.expo?.slug ?? appJson?.slug ?? null; }
 
-export function detect(root, { projectRoot: forcedRoot = null } = {}) {
+// A route is "listed" by an id or a trailing-* prefix (the --exclude and
+// --authenticated syntax).
+const routeListed = (route, ids) => ids.some((id) => id === route.id || (id.endsWith("*") && route.id.startsWith(id.slice(0, -1))));
+// What may precede a route literal for it to count as in-app navigation.
+const NAVIGATION_PREFIX = String.raw`(?:\b(?:push|replace|navigate|redirect|dismissTo|prefetch)\s*\(\s*(?:\{[^}]*?pathname\s*:\s*)?|\bhref\s*[=:]\s*\{?\s*|\bpathname\s*:\s*|\bto\s*[=:]\s*\{?\s*|\binitialRouteName\s*[=:]\s*\{?\s*)`;
+
+export function detect(root, { projectRoot: forcedRoot = null, exclude = [] } = {}) {
   root = path.resolve(root);
   if (!exists(root)) throw new Error(`${root} does not exist`);
   const files = walk(root);
@@ -532,37 +558,45 @@ export function detect(root, { projectRoot: forcedRoot = null } = {}) {
   const build = detectBuild(root, projectRoot, framework, deps, files);
   const existing = Object.fromEntries(Object.entries(FILES).map(([key, file]) => [key, exists(path.join(root, file))]));
   const prefix = projectRoot === "." ? "" : `${projectRoot}/`;
-  const graph = sourceGraph(root, prefix, files, router, auth);
+  const graph = sourceGraph(root, prefix, files, router, auth, { exclude });
   const slug = (pkg?.name ?? expoSlug(root, projectRoot) ?? path.basename(root)).replace(/^@[^/]+\//, "").toLowerCase().replace(/[^a-z0-9._-]/g, "-").slice(0, 64);
-  return { root, projectRoot, framework, platform, packageName: pkg?.name ?? null, suggestedSlug: SLUG.test(slug) ? slug : "my-app", router: { routerKind: router.routerKind, graphPaths: router.graphPaths, routes: router.routes.map(({ id, file, screen, dir, redirectOnly }) => ({ id, file, screen: screen ?? null, dir, redirectOnly: Boolean(redirectOnly), sources: graph.sources.get(file) ?? [], authenticated: graph.inferred.has(id) ? "inferred" : null })), layouts: (router.layouts ?? []).map((layout) => layout.file) }, sharedSources: graph.sharedSources, auth: { ...auth, inferredAuthenticated: [...graph.inferred.entries()].map(([id, from]) => ({ id, referencedFrom: from })) }, hosts, importPaths, build, existing, fileCount: files.length };
+  return { root, projectRoot, framework, platform, packageName: pkg?.name ?? null, suggestedSlug: SLUG.test(slug) ? slug : "my-app", router: { routerKind: router.routerKind, graphPaths: router.graphPaths, routes: router.routes.map(({ id, file, screen, dir, redirectOnly }) => ({ id, file, screen: screen ?? null, dir, redirectOnly: Boolean(redirectOnly), sources: graph.sources.get(file) ?? [], authenticated: graph.inferred.has(id) ? "inferred" : null, inbound: graph.inbound.get(id) ?? null })), layouts: (router.layouts ?? []).map((layout) => layout.file) }, sharedSources: graph.sharedSources, excluded: exclude, auth: { ...auth, inferredAuthenticated: [...graph.inferred.entries()].map(([id, from]) => ({ id, referencedFrom: from })) }, hosts, importPaths, build, existing, fileCount: files.length };
 }
 
 // The screen graph from imports: what each route file reaches (its
-// `sources`), what every route reaches (`sharedSources`, with the layouts
-// and redirect-only routes), and which routes outside a gated layout are
-// reachable only from gated screens (an authenticated start, inferred).
-function sourceGraph(root, prefix, files, router, auth) {
+// `sources`), what every kept route reaches (`sharedSources`, with the
+// layouts and redirect-only routes), which routes outside a gated layout are
+// reachable only from gated screens (an authenticated start, inferred), and
+// which routes no in-app navigation reaches at all (deep links, debug
+// screens: `inbound` "none").
+function sourceGraph(root, prefix, files, router, auth, { exclude = [] } = {}) {
   const fileSet = new Set(files);
   const aliases = loadAliases(root, prefix ? prefix.slice(0, -1) : ".");
   const texts = new Map();
   const routes = router.routes ?? [];
-  const layouts = (router.layouts ?? []).map((layout) => layout.file);
+  const layoutEntries = router.layouts ?? [];
+  const layouts = layoutEntries.map((layout) => layout.file);
   const routeFiles = new Set(routes.map((route) => route.file));
   const closureOf = new Map();
   const closure = (file) => { if (!closureOf.has(file)) closureOf.set(file, importClosure(root, file, { fileSet, aliases, prefix, texts })); return closureOf.get(file); };
   // Files reached by a route, excluding the router's own route and layout
   // files (a screen that imports another screen's file still owns its own).
   const own = (file) => closure(file).filter((entry) => !routeFiles.has(entry) && !layouts.includes(entry));
-  const screens = routes.filter((route) => !route.redirectOnly);
+  // The intersection is over the screens the contract keeps: an excluded
+  // debug route that imports only a database helper must not stop the theme
+  // file every kept screen imports from being shared.
+  const screens = routes.filter((route) => !route.redirectOnly && !routeListed(route, exclude));
   let common = null;
   for (const route of screens) { const set = new Set(own(route.file)); common = common === null ? set : new Set([...common].filter((entry) => set.has(entry))); }
-  // sharedSources = layouts + redirect-only routes + what EVERY screen imports,
-  // plus theme/style directories and global stylesheets (which imports cannot
-  // see: CSS, design tokens). Never a components directory: feature components
-  // live there, and a change to one must scope to the screens that use it.
+  // sharedSources = layouts + redirect-only routes + what EVERY kept screen
+  // imports, plus theme/style directories, design-token files (`theme.ts`
+  // wherever it lives) and global stylesheets (which imports cannot see: CSS,
+  // design tokens). Never a components directory: feature components live
+  // there, and a change to one must scope to the screens that use it.
   const themeDirs = ["src/theme", "src/styles", "src/design", "src/design-system", "app/theme", "styles", "theme", "Sources/Theme", "Sources/DesignSystem"].map((dir) => `${prefix}${dir}`).filter((dir) => files.some((file) => file.startsWith(`${dir}/`))).map((dir) => `${dir}/**`);
+  const themeFiles = files.filter((file) => file.startsWith(prefix) && /^(?:src|app|lib|Sources)\/(?:[^/]+\/){0,3}(?:theme|tokens|design-tokens|colors)\.(?:tsx?|jsx?|json)$/.test(file.slice(prefix.length)) && !routeFiles.has(file) && !themeDirs.some((dir) => matchesGlob(file, dir)));
   const globalFiles = ["tailwind.config.js", "tailwind.config.ts", "src/index.css", "src/globals.css", "app/globals.css"].map((file) => `${prefix}${file}`).filter((file) => fileSet.has(file));
-  const shared = uniq([...layouts, ...routes.filter((route) => route.redirectOnly).map((route) => route.file), ...(screens.length >= 2 && common ? [...common].sort() : []), ...themeDirs, ...globalFiles]);
+  const shared = uniq([...layouts, ...routes.filter((route) => route.redirectOnly).map((route) => route.file), ...(screens.length >= 2 && common ? [...common].sort() : []), ...themeDirs, ...themeFiles.sort(), ...globalFiles]);
   const sharedSet = new Set(shared);
   const sources = new Map();
   for (const route of routes) sources.set(route.file, uniq([route.file, ...own(route.file).filter((entry) => !sharedSet.has(entry)).sort()]));
@@ -577,18 +611,43 @@ function sourceGraph(root, prefix, files, router, auth) {
   const gatedDirs = auth?.gatedDirs ?? [];
   const isGatedDir = (route) => gatedDirs.some((dir) => dir === "" ? false : (route.dir === dir || route.dir?.startsWith(`${dir}/`)));
   const signedOutRoute = (route) => (auth?.signInRoutes ?? []).includes(route.id) || route.redirectOnly || LOW_VALUE_ROUTE.test(route.id);
+  const textOf = (file) => { if (!texts.has(file)) texts.set(file, readText(path.join(root, file)) ?? ""); return texts.get(file); };
+  const sourceFiles = files.filter((file) => file.startsWith(prefix) && /\.(tsx?|jsx?|mjs)$/.test(file) && !/\.(test|spec|stories)\./.test(file) && !NOT_THE_APP.test(file.slice(prefix.length)));
+  // A reference is a navigation, not any string that happens to hold the
+  // path: `router.push("/session")`, `router.replace({ pathname: "/block/[id]" })`,
+  // `<Link href="/upgrade">`, `<Redirect href={...}>`, `navigate("/x")`, `to="/x"`.
+  // A share-URL builder that normalises "/invite/" is none of these, and a
+  // route only such strings mention has no in-app navigation.
+  const referencePattern = (id) => {
+    const staticPart = id.includes(":") || id.includes("*") ? id.slice(0, id.search(/[:*]/)) : id;
+    const groupless = staticPart.replace(/\/\([^)]*\)/g, "");
+    const alternatives = uniq([staticPart, groupless]).filter(Boolean).map(escapeRegExp).join("|");
+    return new RegExp(`${NAVIGATION_PREFIX}["'\`](?:${alternatives})(?:["'\`?]|\\$\\{|\\[)`);
+  };
+  // Inbound navigation: "entry" for the root route, "tabs" for a screen a
+  // tab bar shows (its directory's layout, or its parent's for an index
+  // route, renders <Tabs> / <NativeTabs>), "navigation" when another source
+  // file names the route (router.push, href, Link), "none" otherwise: a deep
+  // link, a debug screen, or a route reached by a computed string the scan
+  // cannot see. The report marks "none" so curation can drop them
+  // deliberately; nothing is dropped automatically.
+  const inbound = new Map();
+  if (router.routerKind === "expo-router") {
+    const layoutText = (dir) => layoutEntries.find((layout) => layout.dir === dir)?.text ?? "";
+    const tabLayout = (dir) => /<(?:Native)?Tabs\b|\bTabs\.Screen\b|createBottomTabNavigator/.test(layoutText(dir));
+    for (const route of routes) {
+      if (route.redirectOnly) continue;
+      const isIndex = /(^|\/)index\.[jt]sx?$/.test(route.file);
+      const parent = route.dir.includes("/") ? route.dir.slice(0, route.dir.lastIndexOf("/")) : "";
+      if (route.id === "/") inbound.set(route.id, "entry");
+      else if (tabLayout(route.dir) || (isIndex && route.dir && tabLayout(parent))) inbound.set(route.id, "tabs");
+      else { const pattern = referencePattern(route.id); inbound.set(route.id, sourceFiles.some((file) => file !== route.file && pattern.test(textOf(file))) ? "navigation" : "none"); }
+    }
+  }
   if (gatedDirs.some((dir) => dir !== "") && routes.length) {
     const gatedLayouts = layouts.filter((file) => gatedDirs.some((dir) => dir && file.startsWith(`${prefix}app/${dir}/`)));
     const signedOutFiles = new Set(routes.filter(signedOutRoute).flatMap((route) => [route.file, ...closure(route.file)]));
     for (const layout of layouts.filter((file) => !gatedLayouts.includes(file))) for (const entry of [layout, ...closure(layout)]) signedOutFiles.add(entry);
-    const textOf = (file) => { if (!texts.has(file)) texts.set(file, readText(path.join(root, file)) ?? ""); return texts.get(file); };
-    const sourceFiles = files.filter((file) => file.startsWith(prefix) && /\.(tsx?|jsx?|mjs)$/.test(file) && !/\.(test|spec|stories)\./.test(file) && !NOT_THE_APP.test(file.slice(prefix.length)));
-    const referencePattern = (id) => {
-      const staticPart = id.includes(":") || id.includes("*") ? id.slice(0, id.search(/[:*]/)) : id;
-      const groupless = staticPart.replace(/\/\([^)]*\)/g, "");
-      const alternatives = uniq([staticPart, groupless]).filter(Boolean).map(escapeRegExp).join("|");
-      return new RegExp(`["'\`](?:${alternatives})(?:["'\`?]|\\$\\{|\\[)`);
-    };
     let gatedFiles = new Set(routes.filter(isGatedDir).flatMap((route) => [route.file, ...closure(route.file)]).concat(gatedLayouts));
     for (let round = 0; round < 4; round += 1) {
       let changed = false;
@@ -606,7 +665,7 @@ function sourceGraph(root, prefix, files, router, auth) {
       if (!changed) break;
     }
   }
-  return { sources, sharedSources: shared, inferred };
+  return { sources, sharedSources: shared, inferred, inbound };
 }
 
 // ---------------------------------------------------------------- drafting
@@ -663,6 +722,30 @@ ${indent(workflowInputs(options), 6)}
 // another version (setup preflight names this cocoapods-lockfile-drift). No
 // CODE_SIGNING_ALLOWED=NO: an unsigned simulator build cannot use the
 // Keychain, which a session import needs.
+// The lockfile recipe the draft writes as comments when no Podfile.lock is
+// tracked, and `pin-cocoapods` removes once the lockfile exists. LANG: pod
+// install parses podspecs as UTF-8 only under a UTF-8 locale, and agent
+// shells often have none (the Suelto run aborted on a podspec's non-ASCII
+// byte). The generated ios/ tree (hundreds of MB of Pods) is deleted after
+// the lockfile is copied out; it is gitignored and rebuilt in CI.
+const LOCKFILE_RECIPE_COMMENT = [
+  "# No Podfile.lock is tracked (ios/ is generated), so pods and the CocoaPods version must be pinned or CI resolves them differently every run. Produce the lockfile once, locally, then run `greenroom-onboard.mjs pin-cocoapods .` to pin its version below and drop this note:",
+  "#   export LANG=en_US.UTF-8 && npx expo prebuild --platform ios --no-install && pod install --project-directory=ios",
+  "#   mkdir -p .greenroom && cp ios/Podfile.lock .greenroom/Podfile.lock && rm -rf ios   # commit the lockfile; ios/ is regenerated in CI",
+];
+const LOCKFILE_RECIPE_LINE = /No Podfile\.lock is tracked|expo prebuild --platform ios --no-install && pod install|cp ios\/Podfile\.lock \.greenroom\/Podfile\.lock/;
+export const COCOAPODS_PLACEHOLDER = "REPLACE_WITH_COCOAPODS_VERSION";
+
+// The repository variable a public SDK key is read from: the key's family
+// (REVENUECAT for EXPO_PUBLIC_REVENUECAT_API_KEY_IOS) plus _TEST_PUBLIC_KEY;
+// the full name when two keys share a family.
+export function sdkFamily(key) { return key.replace(/^EXPO_PUBLIC_/, "").match(/^([A-Z0-9]+)/)?.[1] ?? "SDK"; }
+export function sdkVariableName(key, all = [key]) {
+  const family = sdkFamily(key);
+  const shared = all.filter((other) => sdkFamily(other) === family).length > 1;
+  return shared ? `${key.replace(/^EXPO_PUBLIC_/, "")}_TEST_PUBLIC` : `${family}_TEST_PUBLIC_KEY`;
+}
+
 function iosPrepare(report, { appName, scheme, projectRoot, sdkKeys = [] }) {
   const lines = ["  set -euo pipefail"];
   const { build, framework, hosts } = report;
@@ -675,9 +758,17 @@ function iosPrepare(report, { appName, scheme, projectRoot, sdkKeys = [] }) {
   // Public SDK keys the app needs to start (an SDK that throws without one
   // takes the whole startup chain down). A TEST project's PUBLIC key only;
   // prepare runs with no credentials and this file is readable by anyone
-  // with the repository, so a private key never goes here.
-  if (sdkKeys.length) lines.push("  # Public SDK keys the app needs to start: a TEST project's public key, never a private one (prepare has no credentials and cannot read repository secrets). A GitHub Actions variable (vars.NAME) keeps the value out of Git.", ...sdkKeys.map((key) => `  export ${key}=REPLACE_WITH_${(key.replace(/^EXPO_PUBLIC_/, "").match(/^([A-Z0-9]+)/)?.[1] ?? "SDK")}_TEST_PROJECT_PUBLIC_SDK_KEY`));
-  else {
+  // with the repository, so a private key never goes here. The value comes
+  // in through a GitHub Actions repository VARIABLE (vars.NAME), which keeps
+  // it out of Git and leaves no placeholder in the file; the guard makes a
+  // forgotten variable fail the build early with the variable named.
+  if (sdkKeys.length) {
+    lines.push("  # Public SDK keys the app needs to start: a TEST project's public key, never a private one (prepare has no credentials and cannot read repository secrets). Each is read from a repository variable (Settings > Secrets and variables > Actions > Variables) so the value is not in Git.");
+    for (const key of sdkKeys) {
+      const variable = sdkVariableName(key, sdkKeys);
+      lines.push(`  export ${key}="\${{ vars.${variable} }}"`, `  test -n "$${key}" || { echo "Set the repository variable ${variable} to a ${sdkFamily(key)} TEST project's public key"; exit 1; }`);
+    }
+  } else {
     const candidates = candidateSdkKeys(hosts.sdkKeys ?? [], "ios");
     if (candidates.length) lines.push(`  # This app reads public SDK keys (${candidates.join(", ")}). If an SDK refuses to start without one (an init that throws), re-run the draft with --sdk-keys NAME to export a TEST project's public key here; otherwise leave them unset so the SDK stays off in the test build.`);
   }
@@ -692,13 +783,10 @@ function iosPrepare(report, { appName, scheme, projectRoot, sdkKeys = [] }) {
       // image would resolve pods with whatever CocoaPods it ships, differently
       // from the owner's machine and from run to run). The owner produces
       // .greenroom/Podfile.lock once, locally, and the version it names is pinned here.
-      lines.push(
-        "  # No Podfile.lock is tracked (ios/ is generated), so pods and the CocoaPods version must be pinned or CI resolves them differently every run. Produce the lockfile once, locally:",
-        "  #   npx expo prebuild --platform ios --no-install && pod install --project-directory=ios",
-        "  #   mkdir -p .greenroom && cp ios/Podfile.lock .greenroom/Podfile.lock   # commit it; its last line (COCOAPODS: X.Y.Z) is the version to pin below",
+      lines.push(...LOCKFILE_RECIPE_COMMENT.map((line) => `  ${line}`),
         "  cp .greenroom/Podfile.lock ios/Podfile.lock",
-        "  sudo gem install cocoapods -v REPLACE_WITH_COCOAPODS_VERSION --no-document",
-        "  pod _REPLACE_WITH_COCOAPODS_VERSION_ install --project-directory=ios --deployment",
+        `  sudo gem install cocoapods -v ${COCOAPODS_PLACEHOLDER} --no-document`,
+        `  pod _${COCOAPODS_PLACEHOLDER}_ install --project-directory=ios --deployment`,
       );
     }
   }
@@ -754,19 +842,21 @@ export function capSources(entries, limit = 50) {
 function toStates(report, { auth, maxStates = 20, exclude = [], authenticated = [], entryOverride = null }) {
   const { router, platform } = report;
   const prefix = report.projectRoot === "." ? "" : `${report.projectRoot}/`;
-  const listed = (route, ids) => ids.some((id) => id === route.id || (id.endsWith("*") && route.id.startsWith(id.slice(0, -1))));
+  const listed = routeListed;
   const gated = (route) => auth.mechanism === "session_import" && (listed(route, authenticated) || route.authenticated === "inferred" || report.auth.gatedDirs.some((dir) => dir === "" ? !report.auth.signInRoutes.includes(route.id) : (route.dir === dir || route.dir?.startsWith(`${dir}/`))));
   const featureDirs = (name) => ["src/features", "src/screens", "src/modules", "features", "src/pages"].map((dir) => `${prefix}${dir}/${name}`).filter((dir) => exists(path.join(report.root, dir))).map((dir) => `${dir}/**`);
   // Redirect-only routes are not screens (their file is in sharedSources).
   let routes = router.routes.filter((route) => !listed(route, exclude) && !route.redirectOnly);
   // Tab screens first, then everything but legal/modal/diagnostic screens,
+  // then routes no in-app navigation reaches (deep links, debug screens),
   // shallowest first; the cap keeps the head of that order and the report
   // lists the rest.
-  routes.sort((a, b) => (a.id.includes("(tabs)") ? 0 : 1) - (b.id.includes("(tabs)") ? 0 : 1) || (LOW_VALUE_ROUTE.test(a.id) ? 1 : 0) - (LOW_VALUE_ROUTE.test(b.id) ? 1 : 0) || a.id.split("/").length - b.id.split("/").length || a.id.localeCompare(b.id));
+  routes.sort((a, b) => (a.id.includes("(tabs)") ? 0 : 1) - (b.id.includes("(tabs)") ? 0 : 1) || (LOW_VALUE_ROUTE.test(a.id) ? 1 : 0) - (LOW_VALUE_ROUTE.test(b.id) ? 1 : 0) || (a.inbound === "none" ? 1 : 0) - (b.inbound === "none" ? 1 : 0) || a.id.split("/").length - b.id.split("/").length || a.id.localeCompare(b.id));
   const candidates = routes;
   if (routes.length > maxStates) routes = routes.slice(0, maxStates);
   // Only routes the cap dropped are "omitted"; excluded and redirect-only routes were never candidates.
   const omitted = candidates.filter((route) => !routes.includes(route)).map((route) => route.id);
+  const noInbound = routes.filter((route) => route.inbound === "none").map((route) => route.id);
   const states = routes.map((route) => {
     const screen = screenNameFor(route, platform);
     const feature = path.posix.basename(route.file).replace(/\.[^.]+$/, "").replace(/^index$/, path.posix.basename(path.posix.dirname(route.file))).toLowerCase();
@@ -791,13 +881,14 @@ function toStates(report, { auth, maxStates = 20, exclude = [], authenticated = 
   contract.sharedSources = uniq([...report.sharedSources, ".greenroom/**"]);
   contract.states = states;
   contract.transitions = [];
-  return { contract, omitted };
+  return { contract, omitted, noInbound };
 }
 
 const list = (value) => String(value).split(",").map((entry) => entry.trim()).filter(Boolean);
 
 export async function draft(root, values) {
-  const report = detect(root, { projectRoot: values.root ?? null });
+  const exclude = values.exclude ? list(values.exclude) : [];
+  const report = detect(root, { projectRoot: values.root ?? null, exclude });
   const repo = await loadRepoModules();
   const platform = values.platform ?? report.platform;
   const framework = values.framework ?? report.framework;
@@ -830,8 +921,17 @@ export async function draft(root, values) {
   if (platform === "ios") manifest.notes = values.notes ?? `${framework === "expo" ? "Release simulator build" : "Simulator build"} compiled against the isolated test backend in allowedHosts (sandboxed_backend); production hosts are listed so a walk can prove it never reached one.`;
   manifest.auth = auth;
 
-  const { contract, omitted } = toStates(report, { auth, exclude: values.exclude ? list(values.exclude) : [], authenticated: values.authenticated ? list(values.authenticated) : [], entryOverride: values.entry ?? null });
+  const { contract, omitted, noInbound } = toStates(report, { auth, exclude, authenticated: values.authenticated ? list(values.authenticated) : [], entryOverride: values.entry ?? null });
   if (values.entry && !contract.states.some((state) => state.id === values.entry)) throw new Error(`--entry ${values.entry} is not a drafted state`);
+  // The account precondition: what server-side state the disposable account
+  // must have for a fresh launch to land on the entry state (completed
+  // onboarding, a built plan, a role). A bare account that lands on an
+  // onboarding screen reads as a broken import on the first pass, so the
+  // manifest records the answer and the checklist repeats it; until the
+  // agent answers it (--account-state) the notes carry a named placeholder.
+  const accountState = values["account-state"] ? String(values["account-state"]).trim() : null;
+  if (accountState && !/^[^\n]{1,400}$/.test(accountState)) throw new Error("--account-state is one line of at most 400 characters describing the account's server-side state (never a credential)");
+  if (auth.mechanism === "session_import" && !values.notes) manifest.notes = `${manifest.notes} Account precondition for entryState ${contract.entryState}: ${accountState ?? `${ACCOUNT_STATE_PLACEHOLDER} (what server-side state the disposable account must have so a fresh launch with the imported session lands on ${contract.entryState} instead of onboarding or sign-in; pass --account-state or edit this note)`}.`;
   const appName = values["app-name"] ?? report.build.appName ?? "REPLACE_WITH_APP_NAME";
   const scheme = values.scheme ?? report.build.scheme ?? appName;
   const bundleId = values["bundle-id"] ?? report.build.bundleId ?? null;
@@ -859,7 +959,44 @@ export async function draft(root, values) {
     fs.writeFileSync(target, `${text}\n`);
     written.push(posix(path.relative(out, target)));
   }
-  return { out, written, pin, platform, framework, slug, auth, manifest, contract, omitted, backendHost, sdkKeys, inPlace: out === path.resolve(root), report };
+  return { out, written, pin, platform, framework, slug, auth, manifest, contract, omitted, noInbound, backendHost, sdkKeys, accountState, inPlace: out === path.resolve(root), report };
+}
+const ACCOUNT_STATE_PLACEHOLDER = "REPLACE_WITH_ACCOUNT_STATE";
+
+// `pin-cocoapods DIR`: once .greenroom/Podfile.lock (or ios/Podfile.lock)
+// exists, pin its COCOAPODS version in the workflow's two version lines and
+// drop the drafted lockfile recipe, editing only those lines so hand-written
+// goals, notes and hosts survive (re-drafting would need --overwrite).
+export function pinCocoapods(directory, { lockfile: forced = null } = {}) {
+  directory = path.resolve(directory);
+  const workflowFile = path.join(directory, FILES.workflow);
+  const workflow = readText(workflowFile);
+  if (workflow === null) throw new Error(`${FILES.workflow} is missing; draft first`);
+  const candidates = forced ? [forced] : [".greenroom/Podfile.lock", "ios/Podfile.lock"];
+  const lockfile = candidates.find((file) => exists(path.join(directory, file)));
+  if (!lockfile) throw new Error(`no Podfile.lock at ${candidates.join(" or ")}; produce it once locally (export LANG=en_US.UTF-8 && npx expo prebuild --platform ios --no-install && pod install --project-directory=ios), copy it to .greenroom/Podfile.lock, delete the generated ios/, then rerun`);
+  const version = readText(path.join(directory, lockfile))?.match(/^COCOAPODS:\s*(\d+\.\d+\.\d+)\s*$/m)?.[1] ?? null;
+  if (!version) throw new Error(`${lockfile} has no "COCOAPODS: X.Y.Z" line; it is not a CocoaPods lockfile`);
+  const before = workflow.split("\n");
+  const kept = before.filter((line) => !(/^\s*#/.test(line) && LOCKFILE_RECIPE_LINE.test(line)));
+  const changed = [];
+  const after = kept.map((line) => {
+    let next = line.replaceAll(COCOAPODS_PLACEHOLDER, version);
+    next = next.replace(/(gem install cocoapods\b[^\n]*?(?:-v|--version)[ =]+)\d+\.\d+\.\d+/, `$1${version}`).replace(/\bpod _\d+\.\d+\.\d+_/, `pod _${version}_`);
+    if (next !== line) changed.push(next.trim());
+    return next;
+  });
+  if (!after.some((line) => /\bpod _\d+\.\d+\.\d+_ install\b/.test(line))) throw new Error(`${FILES.workflow} has no CocoaPods install line to pin (expected \`pod _X.Y.Z_ install\` or the drafted placeholder)`);
+  if (lockfile !== "ios/Podfile.lock" && !after.some((line) => new RegExp(`\\bcp\\s+${escapeRegExp(lockfile)}\\s+ios/Podfile\\.lock`).test(line))) {
+    const index = after.findIndex((line) => /gem install cocoapods\b/.test(line));
+    const indentation = after[index]?.match(/^\s*/)?.[0] ?? "        ";
+    after.splice(index < 0 ? after.length : index, 0, `${indentation}cp ${lockfile} ios/Podfile.lock`);
+    changed.push(`cp ${lockfile} ios/Podfile.lock`);
+  }
+  const text = after.join("\n");
+  const removed = before.length - kept.length;
+  if (text !== workflow) fs.writeFileSync(workflowFile, text);
+  return { lockfile, version, changed, removedRecipeLines: removed, unchanged: text === workflow };
 }
 
 // The backend the session refreshes against: --backend-host, else the first
@@ -1089,26 +1226,43 @@ export function stripShellComments(text) {
 
 // Each REPLACE_WITH_* token by name and count, so the check says exactly
 // which placeholder is left rather than "replace the example settings".
+const PLACEHOLDER_CATEGORIES = [
+  [/BACKEND/, "the isolated backend"],
+  [/SDK_KEY|PUBLIC_KEY/, "a test-project public SDK key"],
+  [/COCOAPODS/, "the lockfile's CocoaPods version"],
+  [/ACCOUNT_STATE/, "the account's server-side state for the entry state"],
+  [/SESSION_KEY/, "the Keychain key the app reads its session from"],
+  [/BUNDLE_ID|APP_NAME/, "the app's bundle identifier or name"],
+];
 function namePlaceholders(text, file, issues) {
   const counts = new Map();
   for (const match of text.matchAll(/REPLACE_WITH(?:_[A-Z0-9]+)+(?![A-Z0-9])/g)) counts.set(match[0], (counts.get(match[0]) ?? 0) + 1);
   if (!counts.size) return;
   const listed = [...counts.entries()].map(([token, count]) => `${token}${count > 1 ? ` (${count} occurrences)` : ""}`).join(", ");
-  issues.push({ file, code: "owner-placeholder", message: `Placeholder${counts.size > 1 ? "s" : ""} still to resolve in ${file}: ${listed}. Each is a value only the owner can decide (the isolated backend, a test-project public key, the lockfile's CocoaPods version).` });
+  // Only the categories still present are named, so the message says what
+  // is actually left rather than repeating the whole list every time.
+  const categories = uniq([...counts.keys()].map((token) => PLACEHOLDER_CATEGORIES.find(([pattern]) => pattern.test(token))?.[1] ?? "a value only the owner can decide"));
+  issues.push({ file, code: "owner-placeholder", message: `Placeholder${counts.size > 1 ? "s" : ""} still to resolve in ${file}: ${listed}. ${counts.size > 1 ? "Each is" : "It is"} a value only the owner can decide (${categories.join("; ")}).` });
 }
 
 // ------------------------------------------------------------- checklist
-export function ownerChecklist({ platform, auth, manifest, slug, backendHost = null, sdkKeys = [] }) {
+export function ownerChecklist({ platform, auth, manifest, slug, contract = null, backendHost = null, sdkKeys = [], accountState = null }) {
   const items = [];
   const host = backendHost ?? backendHostOf(manifest.allowedHosts, null);
   const hostText = !host || /REPLACE_WITH/.test(host) ? "the isolated backend host (still to be decided; it replaces the REPLACE_WITH placeholder in allowedHosts and in prepare)" : `the isolated backend ${host} (the host the app's session refreshes against; it is in allowedHosts)`;
   if (auth?.mechanism === "session_import") {
-    items.push(`Create a disposable account on ${hostText}; synthetic data only, minimal role, never a production or personal account.`);
+    const entry = contract?.entryState ?? "the entry state";
+    // Item 0: the state the account must be in. A bare account that lands on
+    // onboarding reads as a broken import on the first pass.
+    items.push(accountState
+      ? `Put the disposable account in the state ${entry} needs before issuing its session: ${accountState}. (Recorded in the manifest notes.)`
+      : `Decide what server-side state the disposable account must have for a fresh launch with the imported session to land on ${entry} rather than onboarding or sign-in (completed onboarding, a built plan, a role, an entitlement); write it into the manifest notes (the draft left ${ACCOUNT_STATE_PLACEHOLDER} there; \`--account-state\` fills it) and put the account in that state before issuing its session.`);
+    items.push(`Create that account on ${hostText}; synthetic data only, minimal role, never a production or personal account.`);
     items.push(`Issue a session for it with the backend's normal session issuer (the same function or endpoint sign-in calls) and store the JSON object {${auth.target.accounts.map((account) => `"${account}": "…"`).join(", ")}} as the repository secret ${auth.secret}. Never paste the value into a file, a PR, a chat or a workflow input.`);
     items.push("Keep the session long enough for a 45-minute job (a refresh token, not a short-lived access token); rotate on a schedule and immediately if it was ever printed.");
     items.push("If the backend rotates refresh tokens (single use, family revocation), the stored secret works for exactly one pass: either reissue it before every pass, or let the isolated backend (not the app) allow reuse for this one synthetic account; per-pass issuance from prepare is available from the runner release after 0.3.16.");
   }
-  if (sdkKeys.length) items.push(`Provide a TEST project's PUBLIC key for ${sdkKeys.join(", ")} (a GitHub Actions variable keeps it out of Git; a private key never goes in prepare), or guard the SDK in a test build so the app starts without it.`);
+  for (const key of sdkKeys) items.push(`Set the repository variable ${sdkVariableName(key, sdkKeys)} (Settings > Secrets and variables > Actions > Variables, not Secrets) to a ${sdkFamily(key)} TEST project's PUBLIC key; prepare exports it as ${key} and stops early if it is unset. A private key never goes in prepare; the alternative is guarding the SDK in a test build so the app starts without it.`);
   items.push("Install the Greenroom GitHub App on this repository (read-only): https://github.com/apps/greenroom-virtual-user/installations/new");
   items.push(`Connect the repository in Greenroom and name the app "${slug}" (the app-id in the workflow).`);
   items.push("Review the diff, then merge the three setup files into the base branch FIRST: policy is read from the base revision, so a pull request cannot start a pass until they are there.");
@@ -1124,9 +1278,11 @@ function printReport(report) {
   lines.push(`Project: ${report.root}${report.projectRoot === "." ? "" : ` (project root ${report.projectRoot})`}`);
   lines.push(`Framework: ${report.framework} -> platform ${report.platform}; suggested app-id ${report.suggestedSlug}`);
   lines.push(`Router: ${report.router.routerKind ?? "none detected"}${report.router.graphPaths ? ` (graphPaths ${report.router.graphPaths.join(", ")})` : ""}; ${report.router.routes.length} route(s); each route's sources are the files it reaches through imports`);
-  for (const route of report.router.routes.slice(0, 40)) lines.push(`  ${route.id}  <- ${route.file}${route.redirectOnly ? "  (redirect only: not a screen, listed in sharedSources)" : ""}${route.authenticated === "inferred" ? "  (reachable only from gated screens: authenticated start inferred; confirm)" : ""}; sources: ${route.sources.length} file(s)${route.sources.length > 1 ? ` (${route.sources.slice(1, 4).join(", ")}${route.sources.length > 4 ? ", …" : ""})` : ""}`);
+  for (const route of report.router.routes.slice(0, 40)) lines.push(`  ${route.id}  <- ${route.file}${route.redirectOnly ? "  (redirect only: not a screen, listed in sharedSources)" : ""}${route.authenticated === "inferred" ? "  (reachable only from gated screens: authenticated start inferred; confirm)" : ""}${route.inbound === "none" ? "  (NO in-app navigation reaches it: a deep link, a debug screen, or a computed route; drop it with --exclude unless it is the entry)" : ""}; sources: ${route.sources.length} file(s)${route.sources.length > 1 ? ` (${route.sources.slice(1, 4).join(", ")}${route.sources.length > 4 ? ", …" : ""})` : ""}`);
   if (report.router.routes.length > 40) lines.push(`  … ${report.router.routes.length - 40} more`);
-  lines.push(`Shared sources (layouts, redirect-only routes, and what EVERY screen imports): ${report.sharedSources.join(", ") || "none found; name the layouts and the files every screen imports"}`);
+  const unreachable = report.router.routes.filter((route) => route.inbound === "none").map((route) => route.id);
+  if (unreachable.length) lines.push(`Routes with no in-app navigation (deep link, debug, or computed): ${unreachable.join(", ")}`);
+  lines.push(`Shared sources (layouts, redirect-only routes, theme files, and what EVERY kept screen imports${report.excluded?.length ? `, computed after --exclude ${report.excluded.join(",")}` : "; pass --exclude to compute this over the kept screens only"}): ${report.sharedSources.join(", ") || "none found; name the layouts and the files every screen imports"}`);
   lines.push(`Build: ${report.build.appName ?? "?"} bundle ${report.build.bundleId ?? "?"}; ${report.build.xcworkspace ?? report.build.xcodeproj ?? "no Xcode project in the tree"}${report.build.iosIgnored ? " (ios/ is gitignored: prebuild in CI)" : ""}; CocoaPods lockfile ${report.build.lockfile ?? "none"}${report.build.cocoapodsVersion ? ` (${report.build.cocoapodsVersion})` : ""}${report.build.sentry ? "; Sentry present (disable source-map upload)" : ""}`);
   lines.push("Hosts found in source (decide allowedHosts from what the TEST build contacts; the rest go to productionHosts):");
   for (const entry of report.hosts.literal) lines.push(`  ${entry.kind.padEnd(16)} ${entry.host}  (${entry.count} file(s): ${entry.files.slice(0, 2).join(", ")})`);
@@ -1148,18 +1304,24 @@ async function main() {
   const { values, positional } = parseArgs(process.argv.slice(2));
   const command = positional[0];
   if (!command || values.help) {
-    console.log("Usage: greenroom-onboard.mjs detect [DIR] [--json] | pin [--platform web|ios] | draft [DIR] --out DIR --app SLUG [--pin SHA] [--auth signed_out|session_import] [--secret NAME] [--accounts a,b] [--service S] [--target-kind expo-secure-store|keychain] [--allowed-hosts h1,h2] [--production-hosts h1,h2] [--backend-host HOST] [--sdk-keys ENV_NAME,ENV_NAME] [--bundle-id ID] [--app-name NAME] [--scheme S] [--device NAME] [--exclude route,route*] [--authenticated route,route*] [--entry route] [--platform web|ios] [--framework F] [--root DIR] [--sandbox-purchases true] [--offline] [--overwrite] | check DIR [--pin SHA] [--offline] [--json]");
+    console.log("Usage: greenroom-onboard.mjs detect [DIR] [--exclude route,route*] [--json] | pin [--platform web|ios] | draft [DIR] --out DIR --app SLUG [--pin SHA] [--auth signed_out|session_import] [--secret NAME] [--accounts a,b] [--service S] [--target-kind expo-secure-store|keychain] [--account-state \"...\"] [--allowed-hosts h1,h2] [--production-hosts h1,h2] [--backend-host HOST] [--sdk-keys ENV_NAME,ENV_NAME] [--bundle-id ID] [--app-name NAME] [--scheme S] [--device NAME] [--exclude route,route*] [--authenticated route,route*] [--entry route] [--platform web|ios] [--framework F] [--root DIR] [--sandbox-purchases true] [--offline] [--overwrite] | pin-cocoapods DIR [--lockfile PATH] | check DIR [--pin SHA] [--offline] [--json]");
     return;
   }
   if (command === "detect") {
-    const report = detect(positional[1] ?? process.cwd(), { projectRoot: values.root ?? null });
+    const report = detect(positional[1] ?? process.cwd(), { projectRoot: values.root ?? null, exclude: values.exclude ? list(values.exclude) : [] });
     console.log(values.json ? JSON.stringify(report, null, 2) : printReport(report));
     return;
   }
   if (command === "pin") {
     const pin = await fetchStablePin({ platform: values.platform ?? "web", docsUrl: values["docs-url"] ?? null });
-    pin.release = await releaseNameOf(pin.sha);
-    console.log(values.json ? JSON.stringify(pin) : `uses: ${pin.uses}\n(read from ${pin.source})\nrelease: ${pin.release}`);
+    pin.release = await releaseNameOf(pin.sha, { docsUrl: values["release-docs-url"] ?? null });
+    console.log(values.json ? JSON.stringify(pin) : `uses: ${pin.uses}\n(read from ${pin.source})\nrelease: ${pin.release}\nRecord the SHA in your setup; it is the identity Greenroom trusts. The release name is for matching issues and changelogs written in release numbers.`);
+    return;
+  }
+  if (command === "pin-cocoapods") {
+    if (!positional[1]) throw new Error("pin-cocoapods DIR: the directory that holds .github/workflows/greenroom.yml and the lockfile");
+    const result = pinCocoapods(positional[1], { lockfile: values.lockfile ?? null });
+    console.log(result.unchanged ? `${FILES.workflow} already pins CocoaPods ${result.version} from ${result.lockfile}; nothing changed.` : `Pinned CocoaPods ${result.version} (from ${result.lockfile}) in ${FILES.workflow}: ${result.changed.join("; ")}${result.removedRecipeLines ? `; removed ${result.removedRecipeLines} lockfile-recipe comment line(s)` : ""}. No other line changed; goals, notes and hosts are untouched. Commit ${result.lockfile} with the setup.`);
     return;
   }
   if (command === "draft") {
@@ -1168,6 +1330,8 @@ async function main() {
     if (values.json) { console.log(JSON.stringify({ ...result, report: undefined }, null, 2)); return; }
     console.log(`Drafted ${result.written.join(", ")} under ${result.out} for ${result.platform}/${result.framework} app "${result.slug}" (workflow pin ${result.pin.sha} from ${result.pin.source}; auth ${result.auth.mechanism}).`);
     if (result.omitted.length) console.log(`States omitted to stay under the 20-state cap (add the important ones by hand): ${result.omitted.join(", ")}`);
+    if (result.noInbound.length) console.log(`Drafted states that no in-app navigation reaches (a deep link, a debug screen, or a route the scan cannot see): ${result.noInbound.join(", ")}. Keep only what a walk from ${result.contract.entryState} can reach; drop the rest with --exclude and re-draft, or delete them from the contract.`);
+    if (result.auth.mechanism === "session_import" && !result.accountState) console.log(`Account precondition not given: answer "what server-side state must the account have for a fresh launch to land on ${result.contract.entryState}?" from the gated layout's conditions, then re-draft with --account-state "..." or replace ${ACCOUNT_STATE_PLACEHOLDER} in the manifest notes by hand.`);
     const placeholders = [];
     for (const file of result.written) { const text = readText(path.join(result.out, file)) ?? ""; for (const match of uniq([...text.matchAll(/REPLACE_WITH(?:_[A-Z0-9]+)+(?![A-Z0-9])|REPLACE with[^."\n]*/g)].map((m) => m[0]))) placeholders.push(`${file}: ${match}`); }
     if (placeholders.length) console.log(`Placeholders to resolve before the check passes:\n  ${placeholders.join("\n  ")}`);
